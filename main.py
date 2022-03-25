@@ -2,6 +2,8 @@ import numpy as np
 import pysam
 from scipy.stats import norm
 from scipy.stats import t
+import matplotlib.pyplot as plt
+from sklearn.cluster import MeanShift
 
 def get_chromosome_lengths(samfile, chromosomes):
     sqs = samfile.header['SQ']
@@ -95,11 +97,12 @@ def freeze_segments(segments, rd_corrected, hr):
             is_frozen[segment_edges[i]:segment_edges[i+1]] = True
     return is_frozen, frozen_segment_starts
 
+
 def mean_shift(counts, rd_corrected, rd_global, limit = 128):
     _, h0 = norm.fit(rd_corrected)
-    hr = [np.sqrt(counts[i] / rd_global) * h0 if
+    hr = np.array([np.sqrt(counts[i] / rd_global) * h0 if
           rd_corrected[i] > rd_global/4 else
-          h0/2 for i in range(len(rd_corrected))]
+          h0/2 for i in range(len(rd_corrected))])
     hb = 2
     is_frozen = np.full(len(counts), False)
     frozen_segment_starts = []
@@ -107,15 +110,27 @@ def mean_shift(counts, rd_corrected, rd_global, limit = 128):
         segments = mean_shift_step(rd_corrected, hb, hr, is_frozen, frozen_segment_starts)
         is_frozen, frozen_segment_starts = freeze_segments(segments, rd_corrected, hr)
         hb += 1
+        print(hb)
+    return segments
 
 
-def mean_shift_gradient(rd, hb, hr):
-    totals = np.zeros_like(rd)
-    j = np.arange(len(rd))
-    for i in range(len(rd)):
-        totals[i] = np.sum(
-            (j - i) * np.exp(-((j - i) ** 2) / (2 * (hb ** 2))) * np.exp(-((rd[j] - rd[i]) ** 2) / (2 * (hr[i] ** 2))))
-    return totals
+def mean_shift_gradient(rd, hb, hr, step=1000):
+    n = len(rd)
+    start = 0
+    total = np.zeros(len(rd))
+    while start < n:
+        print(start)
+        end = np.min((start+step, n))
+        length = end - start
+        ind = np.indices([length, n])
+        ind[0] += start
+        a = ind[0] - ind[1]
+        b = np.exp(-(a**2)/(2*(hb**2)))
+        c = np.exp(-((rd[ind[0]]-rd[ind[1]])**2)/(2*(hr[ind[1]]**2)))
+        total += np.sum(a*b*c, axis=0)
+        start = end
+    return total
+
 
 def mean_shift_partition(rd, gradient):
     start = 0
@@ -129,6 +144,7 @@ def mean_shift_partition(rd, gradient):
             start = i + 1
             segment_starts.append(start)
     return segment_starts, rd_new
+
 
 def reinsert_frozen_segments(segment_starts, frozen_segment_starts, is_frozen):
     all_segment_starts = []
@@ -147,15 +163,22 @@ def reinsert_frozen_segments(segment_starts, frozen_segment_starts, is_frozen):
                 unfrozen_index += 1
     return all_segment_starts
 
+
 def mean_shift_step(rd, hb, hr, is_frozen, frozen_segment_starts):
-    unfrozen_rd = rd[not is_frozen]
-    unfrozen_hr = hr[not is_frozen]
+    unfrozen_rd = rd[np.logical_not(is_frozen)]
+    unfrozen_hr = hr[np.logical_not(is_frozen)]
     shifted_rd = unfrozen_rd
     for i in range(3):
         gradient = mean_shift_gradient(shifted_rd, hb, unfrozen_hr)
         segment_starts, shifted_rd = mean_shift_partition(shifted_rd, gradient)
     all_segment_starts = reinsert_frozen_segments(segment_starts, frozen_segment_starts, is_frozen)
     return all_segment_starts
+
+
+def jank_shift(rd_corrected):
+    data = np.vstack((np.arange(len(rd_corrected)), rd_corrected)).T
+    meanshift = MeanShift(n_jobs=-1, max_iter=2, min_bin_freq=50)
+    return meanshift.fit_predict(data)
 
 
 def definitely_not_cnvnator(path, chromosomes, bin_length):
@@ -165,15 +188,19 @@ def definitely_not_cnvnator(path, chromosomes, bin_length):
         counts, starts, gc_percents = scan_chromosome(chromosome, samfile, bin_length, chromosome_lengths[chromosome])
         rd_corrected, rd_global = gc_correction(counts, gc_percents)
         print(np.unique(rd_corrected))
-        #mean_shift(counts, rd_corrected, rd_global)
+        #segments = mean_shift(counts, rd_corrected, rd_global)
+        segments = jank_shift(rd_corrected)
+        plt.plot(rd_corrected)
+        plt.vlines(segments)
 
 
 def main():
-    path ='../data/SRR_final_sorted.bam'
+    path = '../data/SRR_final_sorted.bam'
     chromosomes = ['chr21']
     # chromosomes = set([f'chr{i}' for i in range(1, 22)] + ['chrX'])
     bin_length = 300
     definitely_not_cnvnator(path, chromosomes, bin_length)
+
 
 if __name__ == '__main__':
     main()
