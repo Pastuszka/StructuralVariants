@@ -4,6 +4,7 @@ from scipy.stats import norm
 from scipy.stats import t
 import matplotlib.pyplot as plt
 from sklearn.cluster import MeanShift
+from Bio import SeqIO
 
 def get_chromosome_lengths(samfile, chromosomes):
     sqs = samfile.header['SQ']
@@ -24,7 +25,7 @@ def scan_chromosome(name, samfile, bin_length, chromosome_length):
     gc_percents = []
     prt = 0
     while start < chromosome_length:
-        iter = samfile.fetch('chr21', start=start, stop=start + bin_length)
+        iter = samfile.fetch(name, start=start, stop=start + bin_length)
         start = start + bin_length
         i = 0
         total_bases = 0
@@ -61,35 +62,52 @@ def gc_correction(counts, gc_percents):
     rd_corrected = (rd_global / rd_gcs_vec) * counts
     return rd_corrected, rd_global
 
+
 def freeze_segments(segments, rd_corrected, hr):
     average_rd = np.mean(rd_corrected)
     is_frozen = np.full(len(rd_corrected), False)
     frozen_segment_starts = []
-    averages = np.empty_like(segments)
-    sds = np.empty_like(segments)
-    ns = np.empty_like(segments)
+    n = len(segments)
+    averages = np.empty(n)
+    sds = np.empty(n)
+    ns = np.empty(n)
     segment_edges = segments
-    segment_edges.append(len(rd_corrected))
-    for i in range(segments):
+    segment_edges.append(n)
+    genome_length = len(rd_corrected)
+    for i in range(n):
         averages[i] = np.mean(rd_corrected[segment_edges[i]:segment_edges[i+1]])
         sds[i] = np.std(rd_corrected[segment_edges[i]:segment_edges[i+1]])
         ns[i] = segment_edges[i+1] - segment_edges[i]
-    for i in range(segments):
+    for i in range(n):
         t1 = ((average_rd - averages[i]) / sds[i]) * np.sqrt(ns[i])
         p1 = 2*(t.cdf(-abs(t1), ns[i] - 1))
-        cond1 = p1 < 0.05
+        segment_length = segment_edges[i+1] - segment_edges[i]
+        p_corr1 = (p1 * 0.99 * genome_length) / segment_length
+        cond1 = p_corr1 < 0.05
         if i > 0:
             mean_diff = averages[i-1] - averages[i]
-            t2 = (mean_diff / sds[i]) * np.sqrt(2)
+            s1 = sds[i-1]
+            s2 = sds[i]
+            n1 = segment_edges[i] - segment_edges[i-1]
+            n2 = segment_length
+            t2 = mean_diff/np.sqrt(s1**2/n1 + s2**2/n2)
+            #t2 = (mean_diff / sds[i]) * np.sqrt(2)
             p2 = 2 * (t.cdf(-abs(t2), 1))
-            cond2 = p2 < 0.01 or abs(mean_diff) >= 2 * hr[i]
+            p2_corr = p2 * 0.99 * genome_length / (n1 + n2)
+            cond2 = p2_corr < 0.01 or abs(mean_diff) >= 2 * hr[i]
         else:
             cond2 = True
-        if i > 0:
+        if i < n-1:
             mean_diff = averages[i+1] - averages[i]
-            t3 = (mean_diff / sds[i]) * np.sqrt(2)
+            s1 = sds[i + 1]
+            s2 = sds[i]
+            n1 = segment_edges[i + 1] - segment_edges[i]
+            n2 = segment_length
+            t3 = mean_diff / np.sqrt(s1 ** 2 / n1 + s2 ** 2 / n2)
+            #t3 = (mean_diff / sds[i]) * np.sqrt(2)
             p3 = 2 * (t.cdf(-abs(t3), 1))
-            cond3 = p3 < 0.01 or abs(mean_diff) >= 2 * hr[i]
+            p3_corr = p3 * 0.99 * genome_length / (n1+n2)
+            cond3 = p3_corr < 0.01 or abs(mean_diff) >= 2 * hr[i]
         else:
             cond3 = True
         if cond1 and cond2 and cond3:
@@ -98,7 +116,7 @@ def freeze_segments(segments, rd_corrected, hr):
     return is_frozen, frozen_segment_starts
 
 
-def mean_shift(counts, rd_corrected, rd_global, limit = 128):
+def mean_shift(counts, rd_corrected, rd_global, limit=128):
     _, h0 = norm.fit(rd_corrected)
     hr = np.array([np.sqrt(counts[i] / rd_global) * h0 if
           rd_corrected[i] > rd_global/4 else
@@ -114,22 +132,25 @@ def mean_shift(counts, rd_corrected, rd_global, limit = 128):
     return segments
 
 
-def mean_shift_gradient(rd, hb, hr, step=1000):
-    n = len(rd)
+def mean_shift_gradient(rd, hb, hr, max_length=40000000):
     start = 0
-    total = np.zeros(len(rd))
-    while start < n:
-        print(start)
-        end = np.min((start+step, n))
-        length = end - start
-        ind = np.indices([length, n])
-        ind[0] += start
-        a = ind[0] - ind[1]
-        b = np.exp(-(a**2)/(2*(hb**2)))
-        c = np.exp(-((rd[ind[0]]-rd[ind[1]])**2)/(2*(hr[ind[1]]**2)))
-        total += np.sum(a*b*c, axis=0)
-        start = end
-    return total
+    gradient = np.empty(len(rd))
+    while start < len(rd):
+        n = min(len(rd)-start, max_length)
+        ind = np.indices([n, hb])
+        ind += start
+        look_right = ind[1] + ind[0] + 1
+        look_right[look_right >= len(rd)] = ind[0][look_right >= len(rd)]
+        look_left = ind[0] - ind[1] - 1
+        look_left[look_left < 0] = ind[0][look_left < 0]
+        i = np.hstack((ind[0], ind[0]))
+        j = np.hstack((look_left, look_right))
+        a = j - i
+        b = np.exp(-(a ** 2) / (2 * (hb ** 2)))
+        c = np.exp(-((rd[j] - rd[i]) ** 2) / (2 * (hr[i] ** 2)))
+        gradient[start:(n+start)] = np.sum(a * b * c, axis=1)
+        start = n
+    return gradient
 
 
 def mean_shift_partition(rd, gradient):
@@ -138,9 +159,9 @@ def mean_shift_partition(rd, gradient):
     rd_new = np.empty_like(rd)
     for i in range(len(gradient)):
         if i == len(gradient) - 1:
-            rd_new[start:i + 1] = np.mean(rd[start:i + 1])
-        if gradient[i] <= 0 < gradient[i + 1]:
-            rd_new[start:i + 1] = np.mean(rd[start:i + 1])
+            rd_new[start:(i + 1)] = np.mean(rd[start:(i + 1)])
+        elif gradient[i] <= 0 < gradient[i + 1]:
+            rd_new[start:(i + 1)] = np.mean(rd[start:(i + 1)])
             start = i + 1
             segment_starts.append(start)
     return segment_starts, rd_new
@@ -175,30 +196,137 @@ def mean_shift_step(rd, hb, hr, is_frozen, frozen_segment_starts):
     return all_segment_starts
 
 
+def merge_signals(rd_corrected, segments):
+    threshold = np.mean(rd_corrected) / 4
+    new_segments = [0]
+    segments.append(len(rd_corrected))
+    for i in range(2, len(segments)):
+        previous_average = np.mean(rd_corrected[new_segments[-1]:segments[i-1]])
+        this_average = np.mean(rd_corrected[segments[i-1]:segments[i]])
+        if np.abs(previous_average - this_average) > threshold:
+            new_segments.append(segments[i-1])
+    return new_segments
+
+
+def call_variants(segments, rd_corrected):
+    segments.append(len(rd_corrected))
+    rd_global = np.mean(rd_corrected)
+    calls = []
+    for i in range(1, len(segments)):
+        start = segments[i-1]
+        end = segments[i]
+        rd_segment = np.mean(rd_corrected[start:end])
+        s_segment = np.std(rd_corrected[start:end])
+        n = end - start
+        if s_segment == 0:
+            calls.append((start, end-1))
+            continue
+        t_stat = ((rd_global-rd_segment)/s_segment)*np.sqrt(n)
+        p = 2 * (t.cdf(-abs(t_stat), n - 1))
+        p_corr = p * 0.99 * len(rd_corrected) / n
+        if p_corr < 0.05:
+            calls.append((start, end - 1))
+    return calls
+
+
+def merge_calls(calls, rd_corrected):
+    new_calls = []
+    genome_length = len(rd_corrected)
+    for i in range(1, len(calls)):
+        call_1 = rd_corrected[calls[i-1][0]:calls[i-1][1]]
+        call_2 = rd_corrected[calls[i][0]:calls[i][1]]
+        region = rd_corrected[calls[i-1][1]:calls[i][0]]
+        mean_1 = np.mean(call_1)
+        mean_2 = np.mean(call_2)
+        mean_r = np.mean(region)
+
+        std_1 = np.std(call_1)
+        std_2 = np.std(call_2)
+        std_r = np.std(region)
+        n1 = len(call_1)
+        n2 = len(call_2)
+        nr = len(region)
+        t1 = (mean_1-mean_r) / np.sqrt(std_1 ** 2 / n1 + std_r ** 2 / nr)
+        t2 = (mean_2 - mean_r) / np.sqrt(std_2 ** 2 / n2 + std_r ** 2 / nr)
+        p1 = 2 * (t.cdf(-abs(t1), 1))
+        p2 = 2 * (t.cdf(-abs(t2), 1))
+        p1_corr = p1 * 0.01 * genome_length / (n1 + nr)
+        p2_corr = p2 * 0.01 * genome_length / (n2 + nr)
+        if p1_corr > 0.01 and p2 > 0.01:
+            calls[i] = (calls[i-1][0], calls[i][1])
+        else:
+            new_calls.append(calls[i-1])
+    new_calls.append(calls[-1])
+    return new_calls
+
+
 def jank_shift(rd_corrected):
     data = np.vstack((np.arange(len(rd_corrected)), rd_corrected)).T
     meanshift = MeanShift(n_jobs=-1, max_iter=2, min_bin_freq=50)
     return meanshift.fit_predict(data)
 
 
+class VariantCall:
+    def __init__(self, chrom, pos, end, ref):
+        self.chrom = chrom
+        self.pos = pos
+        self.end = end
+        self.ref = ref
+
+    def __str__(self):
+        line = self.chrom + '\t' + str(self.pos) + '\t' + '.\t' + str(self.ref) + \
+               '\t.\t.\tLowQual\tIMPRECISE;SVMETHOD=HEMORRHAGEv0.0.0.0.0.1;END=' + str(self.end) + ';'
+        return line
+
+
+def write_vcf(filename, calls):
+    with open(filename, 'w') as f:
+        f.write('##fileformat=VCFv4.2\n')
+        f.write('#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n')
+        for call in calls:
+            print(call, file=f)
+
+
+def create_variant_calls(reference, calls, bin_length, chromosome):
+    variant_calls = []
+    sequence = reference[chromosome]
+    for call in calls:
+        start = call[0] * bin_length
+        end = call[1] * bin_length
+        ref = sequence[start]
+        variant_call = VariantCall(chromosome, start, end, ref)
+        variant_calls.append(variant_call)
+    return variant_calls
+
+
 def definitely_not_cnvnator(path, chromosomes, bin_length):
     samfile = pysam.AlignmentFile(path, "rb")
     chromosome_lengths = get_chromosome_lengths(samfile, chromosomes)
+    reference = SeqIO.index("../data/reference/GRCh38_full_analysis_set_plus_decoy_hla.fa", "fasta")
+    variant_calls = []
     for chromosome in chromosomes:
         counts, starts, gc_percents = scan_chromosome(chromosome, samfile, bin_length, chromosome_lengths[chromosome])
         rd_corrected, rd_global = gc_correction(counts, gc_percents)
         print(np.unique(rd_corrected))
-        #segments = mean_shift(counts, rd_corrected, rd_global)
-        segments = jank_shift(rd_corrected)
+        segments = mean_shift(counts, rd_corrected, rd_global)
+        merged_segments = merge_signals(rd_corrected, segments)
+        #segments = jank_shift(rd_corrected)
+        calls = call_variants(merged_segments, rd_corrected)
+        merged_calls = merge_calls(calls, rd_corrected)
+        variant_calls.extend(create_variant_calls(reference, merged_calls, bin_length, chromosome))
         plt.plot(rd_corrected)
-        plt.vlines(segments)
+        for call in calls:
+            plt.axvspan(call[0], call[1], facecolor='red', alpha=.2)
+        #plt.vlines(merged_segments, ymin=np.min(rd_corrected), ymax=np.max(rd_corrected), colors="b", linestyles='dotted')
+        plt.savefig('test.png')
+    write_vcf('hemorrhage.vcf', variant_calls)
 
 
 def main():
     path = '../data/SRR_final_sorted.bam'
     chromosomes = ['chr21']
     # chromosomes = set([f'chr{i}' for i in range(1, 22)] + ['chrX'])
-    bin_length = 300
+    bin_length = 100
     definitely_not_cnvnator(path, chromosomes, bin_length)
 
 
