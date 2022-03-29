@@ -212,6 +212,7 @@ def call_variants(segments, rd_corrected):
     segments.append(len(rd_corrected))
     rd_global = np.mean(rd_corrected)
     calls = []
+    is_deletion = []
     for i in range(1, len(segments)):
         start = segments[i-1]
         end = segments[i]
@@ -226,11 +227,13 @@ def call_variants(segments, rd_corrected):
         p_corr = p * 0.99 * len(rd_corrected) / n
         if p_corr < 0.05:
             calls.append((start, end - 1))
-    return calls
+            is_deletion = (rd_global-rd_segment) > 0
+    return calls, is_deletion
 
 
-def merge_calls(calls, rd_corrected):
+def merge_calls(calls, rd_corrected, is_deletion):
     new_calls = []
+    new_is_deletion = []
     genome_length = len(rd_corrected)
     for i in range(1, len(calls)):
         call_1 = rd_corrected[calls[i-1][0]:calls[i-1][1]]
@@ -252,12 +255,15 @@ def merge_calls(calls, rd_corrected):
         p2 = 2 * (t.cdf(-abs(t2), 1))
         p1_corr = p1 * 0.01 * genome_length / (n1 + nr)
         p2_corr = p2 * 0.01 * genome_length / (n2 + nr)
-        if p1_corr > 0.01 and p2 > 0.01:
+        if p1_corr > 0.01 and p2_corr > 0.01:
             calls[i] = (calls[i-1][0], calls[i][1])
         else:
             new_calls.append(calls[i-1])
+            new_is_deletion.append(is_deletion[i-1])
+
     new_calls.append(calls[-1])
-    return new_calls
+    is_deletion.append(is_deletion[-1])
+    return new_calls, new_is_deletion
 
 
 def jank_shift(rd_corrected):
@@ -267,15 +273,19 @@ def jank_shift(rd_corrected):
 
 
 class VariantCall:
-    def __init__(self, chrom, pos, end, ref):
+    def __init__(self, chrom, pos, end, ref, is_deletion):
         self.chrom = chrom
         self.pos = pos
         self.end = end
         self.ref = ref
+        if is_deletion:
+            self.type = '<DEL>'
+        else:
+            self.type = '<INS>'
 
     def __str__(self):
-        line = self.chrom + '\t' + str(self.pos) + '\t' + '.\t' + str(self.ref) + \
-               '\t.\t.\tLowQual\tIMPRECISE;SVMETHOD=HEMORRHAGEv0.0.0.0.0.1;END=' + str(self.end) + ';'
+        line = self.chrom + '\t' + str(self.pos) + '\t' + '.\t' + str(self.ref) + '\t' + self.type \
+               '\t.\tLowQual\tIMPRECISE;SVMETHOD=HEMORRHAGEv0.0.0.0.0.1;SVLEN=' + str(self.end-self.pos) + ';'
         return line
 
 
@@ -287,16 +297,26 @@ def write_vcf(filename, calls):
             print(call, file=f)
 
 
-def create_variant_calls(reference, calls, bin_length, chromosome):
+def create_variant_calls(reference, calls, bin_length, chromosome, trim_length, is_deletion):
     variant_calls = []
     sequence = reference[chromosome]
     for call in calls:
-        start = call[0] * bin_length
-        end = call[1] * bin_length
+        start = call[0] * bin_length + trim_length
+        end = call[1] * bin_length + trim_length
         ref = sequence[start]
-        variant_call = VariantCall(chromosome, start, end, ref)
+        variant_call = VariantCall(chromosome, start, end, ref, is_deletion)
         variant_calls.append(variant_call)
     return variant_calls
+
+
+def snip_beginning(counts):
+    i = 0
+    for read in counts:
+        if read == 0:
+            i += 1
+        else:
+            break
+    return i, counts[i:len(counts)]
 
 
 def definitely_not_cnvnator(path, chromosomes, bin_length):
@@ -306,14 +326,15 @@ def definitely_not_cnvnator(path, chromosomes, bin_length):
     variant_calls = []
     for chromosome in chromosomes:
         counts, starts, gc_percents = scan_chromosome(chromosome, samfile, bin_length, chromosome_lengths[chromosome])
+        trim_length, counts_trimmed = snip_beginning(counts)
         rd_corrected, rd_global = gc_correction(counts, gc_percents)
         print(np.unique(rd_corrected))
         segments = mean_shift(counts, rd_corrected, rd_global)
         merged_segments = merge_signals(rd_corrected, segments)
         #segments = jank_shift(rd_corrected)
-        calls = call_variants(merged_segments, rd_corrected)
-        merged_calls = merge_calls(calls, rd_corrected)
-        variant_calls.extend(create_variant_calls(reference, merged_calls, bin_length, chromosome))
+        calls, is_deletion = call_variants(merged_segments, rd_corrected)
+        merged_calls, is_deletion_merged = merge_calls(calls, rd_corrected, is_deletion)
+        variant_calls.extend(create_variant_calls(reference, merged_calls, bin_length, chromosome, trim_length, is_deletion_merged))
         plt.plot(rd_corrected)
         for call in calls:
             plt.axvspan(call[0], call[1], facecolor='red', alpha=.2)
