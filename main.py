@@ -284,7 +284,7 @@ class VariantCall:
             self.type = '<INS>'
 
     def __str__(self):
-        line = self.chrom + '\t' + str(self.pos) + '\t' + '.\t' + str(self.ref) + '\t' + self.type \
+        line = self.chrom + '\t' + str(self.pos) + '\t' + '.\t' + str(self.ref) + '\t' + self.type + \
                '\t.\tLowQual\tIMPRECISE;SVMETHOD=HEMORRHAGEv0.0.0.0.0.1;SVLEN=' + str(self.end-self.pos) + ';'
         return line
 
